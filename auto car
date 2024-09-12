@@ -1,0 +1,258 @@
+import math, cv2
+from vehicle import Car, Driver
+import numpy as np
+from controller import Camera, DistanceSensor, Robot
+driver = Driver()
+timestep = 64
+
+
+#camera
+camera = driver.getCamera('camera')
+Camera.enable(camera, timestep)
+
+
+#distance sensors
+sensorsNames = [
+    "front",
+    "front right 0",
+    "front right 1",
+    "front right 2",
+    "front left 0",
+    "front left 1",
+    "front left 2"]
+sensors = {}
+
+for name in sensorsNames:
+    sensors[name] = driver.getDevice(name)
+    DistanceSensor.enable(sensors[name], timestep)
+   
+
+#variables
+x = 0
+maxspeed = 10
+minspeed = 0.1
+brake = 0.9
+
+
+#Def
+
+def take_picture(x):
+    stringimage = str(x) + '.jpg'
+    Camera.saveImage(camera, stringimage, 40)
+    readimage = cv2.imread(str(x) + '.jpg')
+    return readimage
+    
+    
+def detect_edges(cameraimage):
+    grayimage = cv2.cvtColor(cameraimage, cv2.COLOR_BGR2GRAY)
+    blurimage = cv2.GaussianBlur(grayimage, (7, 7), 0)
+    cannyimage = cv2.Canny(blurimage, 100, 200)   
+    return cannyimage
+
+
+def mask(edges):
+    vertices = np.array([[(0, 360), (90, 250), (510, 250), (600, 360)]], dtype=np.int32)
+    mask = np.zeros_like(edges) #image original size
+    cv2.fillPoly(mask, vertices, 255) #create mask
+    maskedimage = cv2.bitwise_and(edges, mask) #apply the mask on the cannyimage
+    return maskedimage
+    
+
+def detect_lines(regionofinterest):
+    rho = 1  #distance resolution in pixels
+    theta = np.pi/180  #angular resolutions in radians
+    threshold = 10  #min number of nodes in a line
+    min_line_len = 10  #min number of pixels making up a line
+    max_line_gap = 70  #max gap in pixels between connectable line segments
+    lines = cv2.HoughLinesP(regionofinterest, rho, theta, threshold, np.array([]), minLineLength = min_line_len, maxLineGap = max_line_gap)
+    return lines
+
+
+def show_lines(cameraimage, line_segments):
+    alpha = 1
+    betha = 1
+    gama = 0
+    
+    #create an empty black image
+    lineimage = np.zeros((cameraimage.shape[0], cameraimage.shape[1], 3), dtype = np.uint8)
+    
+    if line_segments is not None:
+        for line in line_segments:
+            for x1, y1, x2, y2 in line:
+                cv2.line(lineimage, (x1, y1), (x2, y2), [255, 0, 0], 20)
+                 
+         
+    originalimagelines = cv2.addWeighted(cameraimage, alpha, lineimage, betha, gama)
+    cv2.imwrite((str(x+1) + '.jpg'), originalimagelines)
+
+
+def slope(cameraimage, line_segments):
+    lane_lines = []
+    left_fit = []
+    right_fit = []
+    height, width, _ = cameraimage.shape 
+    left_region_boundary = width * (1/2)  
+    right_region_boundary = width * (1/2)
+
+    if line_segments is not None:
+        for line in line_segments:
+            for x1, y1, x2, y2 in line:
+                if y1 == y2:
+                    print("Horizontal Line Detected!")
+                    break
+                fit = np.polyfit((x1, x2), (y1, y2), 1) #polynomial formula and fitting datapoints
+                slope = fit[0]
+                intercept = fit[1]
+                
+                if slope < 0:
+                    if x1 < left_region_boundary and x2 < left_region_boundary:
+                        left_fit.append((slope, intercept))
+                else:
+                    if x1 > right_region_boundary and x2 > right_region_boundary:
+                        right_fit.append((slope, intercept))
+               
+     
+    left_fit_average = np.average(left_fit, axis=0) 
+    if len(left_fit) > 0 and left_fit_average[0] > -0.90:
+        lane_lines.append(make_points(cameraimage, left_fit_average))
+
+    right_fit_average = np.average(right_fit, axis=0)
+    if len(right_fit) > 0 and right_fit_average[0] > 0.47:
+        lane_lines.append(make_points(cameraimage, right_fit_average))
+    
+    return lane_lines
+
+
+def make_points(cameraimage, line):
+    height, width, _ = cameraimage.shape  
+    slope, intercept = line
+    y1 = height  # bottom of the frame because y has 0 at the top of coordination
+    y2 = int(y1 * 3/5)  # make points from 3/5 of the frame down
+ 
+    #y=mx+b   =>  x=(y-b)/m
+    x1 = int((y1 - intercept) / slope)
+    x2 = int((y2 - intercept) / slope)  
+       
+    return [[x1, y1, x2, y2]]
+
+
+def showavgline(cameraimage, lane_lines):
+    alpha = 1
+    betha = 1
+    gama = 0
+    #create an empty black image
+    avgimage = np.zeros((cameraimage.shape[0], cameraimage.shape[1], 3), dtype = np.uint8)
+    
+    for line in lane_lines:
+        for x1, y1, x2, y2 in line:
+            cv2.line(avgimage, (x1, y1), (x2, y2), [0, 0, 255], 20)
+                 
+           
+    originalimagelines = cv2.addWeighted(cameraimage, alpha, avgimage, betha, gama)
+    cv2.imwrite((str(x+3) + '.jpg'), originalimagelines)
+
+
+def compute_steering_angle(cameraimage, lane_lines):
+    #to compute the headingline
+    # to find the middle point of two lines
+
+    if len(lane_lines) == 0:
+        print('No lane lines detected, do nothing')
+        return -90
+
+    height, width, _ = cameraimage.shape
+    if len(lane_lines) == 1:
+        print('Only detected one lane line, just follow it. %s')
+        x1, _, x2, _ = lane_lines[0][0]
+        x_offset = x2 - x1
+    else:
+        _, _, left_x2, _ = lane_lines[0][0] #left lines
+        _, _, right_x2, _ = lane_lines[1][0] #right lines
+      
+        mid = int(width / 2) 
+        x_offset = (left_x2 + right_x2) / 2 - mid  #minus 2 bc of truth of our work
+
+    # find the steering angle, which is angle between navigation direction to end of center line
+    y_offset = int(height / 2)
+    
+    
+    angle_to_mid_radian = math.atan(x_offset / y_offset)  # angle (in radian) to center vertical line
+    angle_to_mid_deg = int(angle_to_mid_radian * 180.0 / math.pi)  # angle (in degrees) to center vertical line
+    steering_angle = angle_to_mid_deg + 90
+    
+    
+    #print('new steering angle: %s' % steering_angle)
+    return steering_angle
+
+
+
+def display_heading_line(cameraimage, steering_angle):
+   
+    line_color=(0, 0, 255)
+    line_width=20
+   
+    heading_image = np.zeros_like(cameraimage)
+    height, width, _ = cameraimage.shape
+
+    steering_angle_radian = steering_angle / 180.0 * math.pi
+    x1 = int(width / 2)
+    y1 = height
+    x2 = int(x1 - height / 2 / math.tan(steering_angle_radian))
+    y2 = int(height / 2)
+
+    cv2.line(heading_image, (x1, y1), (x2, y2), line_color, line_width)
+    heading_image = cv2.addWeighted(cameraimage, 1, heading_image, 1, 0)
+    
+    cv2.imwrite((str(x+2) + '.jpg'), heading_image)
+
+
+driver.setSteeringAngle(0)
+driver.setCruisingSpeed(maxspeed)
+
+while driver.step() != -1:
+       
+    #camera
+    if x%15==0:
+        cameraimage = take_picture(x)
+        edges = detect_edges(cameraimage)
+        regionofinterest = mask(edges)
+        line_segments = detect_lines(regionofinterest)
+        show_lines(cameraimage, line_segments)
+        lane_lines = slope(cameraimage, line_segments)
+        showavgline(cameraimage, lane_lines)
+        angle = compute_steering_angle(cameraimage, lane_lines)
+        display_heading_line(cameraimage, angle) 
+        
+        if angle == 90:
+            driver.setSteeringAngle(0)
+            driver.setCruisingSpeed(maxspeed)
+            print("--forward--") 
+        elif 45 < angle < 89:
+            driver.setSteeringAngle(-0.1)
+            driver.setCruisingSpeed(maxspeed)   
+            print("--turn left--")          
+        elif 91 < angle < 135:
+            driver.setSteeringAngle(0.1)
+            driver.setCruisingSpeed(maxspeed) 
+            print("--turn right--") 
+             
+        
+    x=x+1
+    
+
+    #DistanceSensor
+    front = sensors["front"].getValue()
+    frontright0 = sensors["front right 0"].getValue()
+    frontright1 = sensors["front right 1"].getValue()
+    frontright2 = sensors["front right 2"].getValue()
+    frontleft0 = sensors["front left 0"].getValue()
+    frontleft1 = sensors["front left 1"].getValue()
+    frontleft2 = sensors["front left 2"].getValue()    
+   
+   
+    
+    if front < 100 or frontright0 < 100 or frontleft0 < 100 or frontright1 < 100 or frontleft1 < 100:
+        print("h")
+        driver.setCruisingSpeed(minspeed)
+        driver.setBrakeIntensity(brake)
+        driver.setSteeringAngle(0)
